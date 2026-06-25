@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c ' *)",
+      "Bash(cd /d)",
+      "Bash(python3 -c \"import json; data = json.load\\(open\\('Desktop/python/AI_cup/0.59\\(擴大訓練，使用val+train的json\\)/BERT2/dataset/vpesg4k_train_augmented.json'\\)\\); print\\('Train augmented:', len\\(data\\)\\); print\\('Keys:', list\\(data[0].keys\\(\\)\\)\\); print\\('Promise Status Distribution:'\\); from collections import Counter; print\\(Counter\\(d.get\\('promise_status', 'N/A'\\) for d in data\\)\\)\")"
+    ]
+  }
+}
