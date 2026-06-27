@@ -10,15 +10,16 @@
 2. [目錄結構](#目錄結構)
 3. [環境安裝](#環境安裝)
 4. [資料說明](#資料說明)
-5. [資料前處理](#資料前處理)
-6. [模型訓練](#模型訓練)
-7. [推理與預測](#推理與預測)
-8. [資料後處理（Cascade 邏輯）](#資料後處理cascade-邏輯)
-9. [輸出結果](#輸出結果)
-10. [設定檔說明](#設定檔說明)
-11. [執行方式](#執行方式)
-12. [各任務評估指標](#各任務評估指標)
-13. [常見問題](#常見問題)
+5. [資料擴增（LLM 改寫）](#資料擴增llm-改寫)
+6. [資料前處理](#資料前處理)
+7. [模型訓練](#模型訓練)
+8. [推理與預測](#推理與預測)
+9. [資料後處理（Cascade 邏輯）](#資料後處理cascade-邏輯)
+10. [輸出結果](#輸出結果)
+11. [設定檔說明](#設定檔說明)
+12. [執行方式](#執行方式)
+13. [各任務評估指標](#各任務評估指標)
+14. [常見問題](#常見問題)
 
 ---
 
@@ -47,7 +48,13 @@
 ### 系統架構
 
 ```
-原始 JSON 資料
+vpesg4k_train_1000.json（原始 1,000 筆）
+     │
+     ▼ augment.py（claude-sonnet-4-6 語意改寫 ×4）
+     │
+vpesg4k_train_augmented.json（4,992 筆）
+     │
+     ▼ 合併 val_1000（+1,000 筆）
      │
      ▼
 ┌─────────────────────────────────┐
@@ -88,9 +95,11 @@
 ```
 BERT2/
 ├── config.py                          # 全域設定（模型名稱、路徑、超參數、任務設定）
+├── augment.py                         # 資料擴增腳本（使用 claude-sonnet-4-6 改寫）
 ├── train.py                           # 訓練腳本
 ├── test.py                            # 推理腳本（生成繳交 CSV）
 ├── dataset/
+│   ├── vpesg4k_train_1000.json        # 原始訓練集（1,000 筆，擴增來源）
 │   ├── vpesg4k_train_augmented.json   # 擴增訓練集（4,992 筆）
 │   ├── vpesg4k_val_1000.json          # 驗證集（合併至訓練，1,000 筆）
 │   └── vpesg4k_test_2000.json         # 測試集（2,000 筆，無標籤）
@@ -168,12 +177,136 @@ pip install -r txt/requirements.txt
 
 | 資料集 | 檔案 | 筆數 | 用途 |
 |--------|------|------|------|
+| 原始訓練集 | `vpesg4k_train_1000.json` | 1,000 | 資料擴增來源 |
 | 擴增訓練集 | `vpesg4k_train_augmented.json` | 4,992 | 訓練 |
 | 驗證集 | `vpesg4k_val_1000.json` | 1,000 | 合併至訓練（擴大訓練資料） |
 | 測試集 | `vpesg4k_test_2000.json` | 2,000 | 推理生成繳交檔 |
 | **訓練合計** | | **5,992** | |
 
 > **關鍵決策**：將原本的驗證集（`vpesg4k_val_1000.json`）也合併入訓練，擴大訓練資料量以提升模型泛化能力，是本版本（0.59）相較前一版的主要改動。
+
+---
+
+## 資料擴增（LLM 改寫）
+
+### 概述
+
+原始訓練集 `vpesg4k_train_1000.json` 僅有 **1,000 筆**資料，類別分佈不平衡且樣本量不足，難以直接訓練。本專案使用 **claude-sonnet-4-6** 對每筆資料的 `data` 欄位進行語意改寫，保留原始標籤不變，最終產出 **4,992 筆** 的 `vpesg4k_train_augmented.json`（約 5× 擴增）。
+
+### 擴增策略
+
+| 策略 | 說明 |
+|------|------|
+| **語意改寫** | 用不同用詞、句式重新表達相同語意，保留 ESG 承諾的核心資訊 |
+| **標籤不變** | `promise_status`、`evidence_status`、`evidence_quality`、`verification_timeline` 四個標籤完全繼承自原始資料 |
+| **多次生成** | 每筆原始資料產生約 4 筆改寫版本，再加上原始資料本身組成擴增集 |
+| **失敗跳過** | API 呼叫失敗或回傳格式異常時跳過該筆，不強制補全 |
+
+### 擴增腳本
+
+```python
+# augment.py — 使用 claude-sonnet-4-6 對 ESG 訓練資料進行語意改寫擴增
+import json
+import time
+import copy
+import anthropic
+
+INPUT_FILE   = "dataset/vpesg4k_train_1000.json"
+OUTPUT_FILE  = "dataset/vpesg4k_train_augmented.json"
+AUGMENT_PER_SAMPLE = 4   # 每筆原始資料產生幾筆改寫
+MODEL        = "claude-sonnet-4-6"
+MAX_TOKENS   = 1024
+
+client = anthropic.Anthropic()  # 讀取環境變數 ANTHROPIC_API_KEY
+
+
+def build_prompt(text: str) -> str:
+    return f"""你是一位專業的中文 ESG 報告撰寫者。
+請將以下這段企業 ESG 報告文字，用**不同的用詞與句式**改寫，使語意與原文相同但表達方式不同。
+要求：
+1. 保留所有具體數字、年份、指標、公司名稱等關鍵事實
+2. 保留原文中承諾、證據、時間範圍等語意資訊
+3. 僅回傳改寫後的文字，不要加任何前綴或說明
+
+原文：
+{text}
+
+改寫："""
+
+
+def augment_one(record: dict, new_id: int, text: str) -> dict | None:
+    try:
+        response = client.messages.create(
+            model=MODEL,
+            max_tokens=MAX_TOKENS,
+            messages=[{"role": "user", "content": build_prompt(text)}],
+        )
+        rewritten = response.content[0].text.strip()
+        if not rewritten:
+            return None
+        new_record = copy.deepcopy(record)
+        new_record["id"]   = new_id
+        new_record["data"] = rewritten
+        return new_record
+    except Exception as e:
+        print(f"  [WARN] id={record['id']} 擴增失敗：{e}")
+        return None
+
+
+def main():
+    with open(INPUT_FILE, encoding="utf-8") as f:
+        original = json.load(f)
+
+    augmented = []
+    new_id = max(r["id"] for r in original) + 1  # 新 id 從原始最大值 +1 開始
+
+    for i, record in enumerate(original):
+        augmented.append(record)  # 保留原始資料
+        text = record.get("data", "")
+        if not text:
+            continue
+
+        print(f"[{i+1}/{len(original)}] id={record['id']} 擴增中...")
+        for _ in range(AUGMENT_PER_SAMPLE):
+            result = augment_one(record, new_id, text)
+            if result:
+                augmented.append(result)
+                new_id += 1
+            time.sleep(0.3)  # 避免觸發速率限制
+
+    with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
+        json.dump(augmented, f, ensure_ascii=False, indent=2)
+
+    print(f"\n完成！原始 {len(original)} 筆 → 擴增後 {len(augmented)} 筆")
+    print(f"輸出至：{OUTPUT_FILE}")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+### 執行方式
+
+```bash
+# 安裝 Anthropic SDK
+pip install anthropic
+
+# 設定 API 金鑰
+export ANTHROPIC_API_KEY="sk-ant-..."   # Windows: set ANTHROPIC_API_KEY=sk-ant-...
+
+# 執行擴增（約需 30～60 分鐘，依網路與 API 速率而定）
+python augment.py
+```
+
+### 擴增前後資料統計
+
+| 資料集 | 檔案 | 筆數 |
+|--------|------|------|
+| 原始訓練集 | `vpesg4k_train_1000.json` | 1,000 |
+| 擴增後訓練集 | `vpesg4k_train_augmented.json` | 4,992 |
+| 擴增倍率 | | ≈ 5× |
+
+> **注意**：擴增腳本每次執行結果因 LLM 隨機性而略有不同，但標籤欄位（`promise_status` 等）完全繼承自原始資料，不受影響。
 
 ---
 
@@ -583,5 +716,5 @@ Task 3 評估權重最高（35%），可優先嘗試：
 
 | 版本 | 主要改動 |
 |------|----------|
-| BERT2（本版） | 合併 val\_1000 至訓練資料；Task2/3/4 改用 cascade 架構，僅用 `data` 欄位；FocalLoss；Early Stopping |
-| BERT1（前版） | 僅使用 train\_augmented；Task2/3/4 使用 promise\_string |
+| BERT2（本版） | 以 claude-sonnet-4-6 將 train\_1000 擴增為 train\_augmented（4,992 筆）；合併 val\_1000；Task2/3/4 改用 cascade 架構，僅用 `data` 欄位；FocalLoss；Early Stopping |
+| BERT1（前版） | 僅使用 train\_1000（原始 1,000 筆）；Task2/3/4 使用 promise\_string |
